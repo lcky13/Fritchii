@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1632,7 +1633,14 @@ bool QueryCacheRuntime::HostConditionalRenderingCompareValues(VideoCommon::Looku
     auto driver_id = impl->device.GetDriverID();
     const bool is_gpu_high = Settings::IsGPULevelHigh();
 
-    if ((!is_gpu_high && driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) || driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY || driver_id == VK_DRIVER_ID_ARM_PROPRIETARY || driver_id == VK_DRIVER_ID_MESA_TURNIP) {
+    // Fast GPU mode skips host conditional rendering on Intel, drawing everything the game
+    // would have hidden by occlusion (glare through walls, flicker). FRITCHII_INTEL_CONDREND=1
+    // keeps it on, for checking whether that's where artifacts on Arc come from.
+    static const bool intel_condrend = [] {
+        const char* value = std::getenv("FRITCHII_INTEL_CONDREND");
+        return value != nullptr && value[0] == '1';
+    }();
+    if ((!is_gpu_high && !intel_condrend && driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) || driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY || driver_id == VK_DRIVER_ID_ARM_PROPRIETARY || driver_id == VK_DRIVER_ID_MESA_TURNIP) {
         EndHostConditionalRendering();
         TraceConditionalRendering("driver-bypass", true, object_1.address, object_2.address);
         return true;
