@@ -463,8 +463,11 @@ namespace {
 // (a soft affinity the power manager respects) and background workers on the slower ones.
 // EDEN_HYBRID_CORES=0 turns this off.
 struct WindowsCpuSets {
-    std::vector<ULONG> performance;
-    std::vector<ULONG> efficiency;
+    std::vector<ULONG> performance; // the highest EfficiencyClass (Intel P-cores)
+    std::vector<ULONG> efficiency;  // everything else
+    // Everything but the lowest class when there are 3+ classes (Lunar/Panther Lake: P-cores and
+    // E-cores, without the low-power E-cores); the performance set otherwise.
+    std::vector<ULONG> fast;
     bool hybrid = false;
 };
 
@@ -500,6 +503,9 @@ const WindowsCpuSets& CpuSets() {
         };
         std::vector<Entry> entries;
         u8 best = 0;
+        u8 lowest = 0xFF;
+        u32 parked = 0;
+        u32 allocated = 0;
         for (ULONG offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= length;) {
             const auto* info =
                 reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
@@ -509,14 +515,38 @@ const WindowsCpuSets& CpuSets() {
             if (info->Type == CpuSetInformation) {
                 entries.push_back({info->CpuSet.Id, info->CpuSet.EfficiencyClass});
                 best = (std::max)(best, static_cast<u8>(info->CpuSet.EfficiencyClass));
+                lowest = (std::min)(lowest, static_cast<u8>(info->CpuSet.EfficiencyClass));
+                parked += info->CpuSet.Parked ? 1 : 0;
+                allocated += info->CpuSet.Allocated ? 1 : 0;
             }
             offset += info->Size;
+        }
+        u32 per_class[256]{};
+        for (const Entry& entry : entries) {
+            ++per_class[entry.efficiency_class];
+        }
+        u32 class_count = 0;
+        std::string classes;
+        for (u32 c = 0; c < 256; ++c) {
+            if (per_class[c] != 0) {
+                ++class_count;
+                classes += fmt::format("{}class {}: {}", classes.empty() ? "" : ", ", c,
+                                       per_class[c]);
+            }
         }
         for (const Entry& entry : entries) {
             (entry.efficiency_class == best ? result.performance : result.efficiency)
                 .push_back(entry.id);
+            if (class_count >= 3 ? entry.efficiency_class != lowest : entry.efficiency_class == best) {
+                result.fast.push_back(entry.id);
+            }
         }
         result.hybrid = !result.efficiency.empty() && result.performance.size() >= 2;
+        // Always logged, so a log shows why placement did or didn't turn on.
+        LOG_INFO(Common, "CPU sets: {} logical processors ({}), {} parked, {} allocated; "
+                         "hybrid placement {}; GPU threads on {}, other busy threads on {}",
+                 entries.size(), classes, parked, allocated, result.hybrid ? "on" : "off",
+                 result.performance.size(), result.fast.size());
         if (result.hybrid) {
             LOG_INFO(Common,
                      "Hybrid CPU: {} performance and {} efficiency logical processors, "
@@ -539,6 +569,34 @@ void SelectCurrentThreadCpuSets(const std::vector<ULONG>& ids) {
              static_cast<ULONG>(ids.size()))) {
         LOG_WARNING(Common, "SetThreadSelectedCpuSets failed: {}", Common::GetLastErrorMsg());
     }
+}
+
+// The process already opts out of EcoQoS (SetHighQoS); this does it per thread too, since Windows
+// can still apply it to a thread the process didn't create the policy for.
+void DisableThreadPowerThrottling() {
+    using PFN_SetThreadInformation = BOOL(WINAPI*)(HANDLE, THREAD_INFORMATION_CLASS, LPVOID, DWORD);
+    static const auto set = reinterpret_cast<PFN_SetThreadInformation>(reinterpret_cast<void*>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation")));
+    if (set == nullptr) {
+        return;
+    }
+    // THREAD_POWER_THROTTLING_STATE spelled out: some MinGW headers lack it.
+    struct {
+        ULONG Version;
+        ULONG ControlMask;
+        ULONG StateMask;
+    } state{1 /*CURRENT_VERSION*/, 0x1 /*EXECUTION_SPEED*/, 0 /*not throttled*/};
+    set(GetCurrentThread(), static_cast<THREAD_INFORMATION_CLASS>(3) /*ThreadPowerThrottling*/,
+        &state, sizeof(state));
+}
+
+// FRITCHII_PRIMARY_CORES=0: the GPU threads get the same cores as other busy threads.
+bool PrimaryCoresDisabledByUser() {
+    static const bool disabled = [] {
+        const char* value = std::getenv("FRITCHII_PRIMARY_CORES");
+        return value != nullptr && value[0] == '0';
+    }();
+    return disabled;
 }
 
 /// Masks of processor group 0's logical processors that share a `relation` (a physical core, or
@@ -713,9 +771,21 @@ void SetCurrentThreadToPerformanceCores() {
     }
     SetCurrentThreadCoreGroup(CoreGroup::Performance);
 #elif defined(_WIN32)
+    DisableThreadPowerThrottling();
     if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
-        SelectCurrentThreadCpuSets(sets.performance);
+        SelectCurrentThreadCpuSets(sets.fast);
     }
+#endif
+}
+
+void SetCurrentThreadToPrimaryCores() {
+#if defined(_WIN32)
+    DisableThreadPowerThrottling();
+    if (const WindowsCpuSets& sets = CpuSets(); sets.hybrid) {
+        SelectCurrentThreadCpuSets(PrimaryCoresDisabledByUser() ? sets.fast : sets.performance);
+    }
+#else
+    SetCurrentThreadToPerformanceCores();
 #endif
 }
 

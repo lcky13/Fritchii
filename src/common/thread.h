@@ -108,6 +108,10 @@ enum class ThreadPlacement : u32 {
 void SetCurrentThreadPriority(ThreadPriority new_priority);
 void SetCurrentThreadName(const char* name);
 void SetCurrentThreadToPerformanceCores();
+/// The fastest core class only (Intel P-cores), for the split GPU thread's halves that every
+/// frame waits on. FRITCHII_PRIMARY_CORES=0 gives them SetCurrentThreadToPerformanceCores()'s
+/// cores instead; elsewhere it is SetCurrentThreadToPerformanceCores().
+void SetCurrentThreadToPrimaryCores();
 
 /// Windows: one physical performance core each for the split GPU thread's halves and the guest
 /// cores kept off them, so an SMT sibling never shares the GPU threads' core. See
